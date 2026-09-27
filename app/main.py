@@ -15,11 +15,21 @@ POST /propagate-product 接收 1～8 个独立测量值 {"factors": [...], "to":
 POST /solve-quantities 接收 1～8 个互异变量 {"variables": [...]} 与 1～16 条
 带单位的线性等式 {"equations": [...]}，逐项核对量纲后用有理数精确消元；
 仅唯一解返回按变量名排序的 values，无解、欠定或输入非法返回 422。
+
+POST /fit-calibration 接收 3～16 个标定点 {"points": [...]} 与目标单位
+x_to、y_to，按 1/y_uncertainty² 加权用有理数精确拟合 y = a·x + b，返回
+slope（y_to/x_to）、intercept（y_to）与残差 chi_square；x 全相同或
+输入非法返回 422。
 """
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .calibration import (
+    CalibrationError,
+    CalibrationPoint,
+    fit_calibration,
+)
 from .converter import (
     DimensionMismatchError,
     InvalidValueError,
@@ -60,11 +70,11 @@ from .solver import (
 
 app = FastAPI(
     title="Unit Converter API",
-    version="1.4.0",
+    version="1.5.0",
     description="长度 / 质量 / 时间 / 温度四维量纲的单位换算，"
                 "支持复合单位表达式、°C / °F 偏移温标、量纲推断、"
-                "最简无量纲乘积搜索、乘积一阶不确定度传播与"
-                "带单位线性方程组精确求解。",
+                "最简无量纲乘积搜索、乘积一阶不确定度传播、"
+                "带单位线性方程组精确求解与加权线性标定拟合。",
 )
 
 
@@ -231,6 +241,33 @@ class SolveQuantitiesResponse(BaseModel):
     values: dict[str, str]
 
 
+class CalibrationPointModel(BaseModel):
+    """一个标定点：x 精确（x_unit 为其单位表达式），y 带 y_uncertainty
+    （与 y 同单位、恒正）；所有数值为有限十进制字符串。"""
+    model_config = ConfigDict(extra="forbid")
+
+    x: str = Field(max_length=10_000, description="有限十进制字符串（精确）")
+    x_unit: str = Field(min_length=1, max_length=2_000, description="x 的单位表达式")
+    y: str = Field(max_length=10_000, description="有限十进制字符串")
+    y_unit: str = Field(min_length=1, max_length=2_000, description="y 的单位表达式")
+    y_uncertainty: str = Field(max_length=10_000,
+                               description="恒正有限十进制字符串，与 y 同单位")
+
+
+class FitCalibrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    x_to: str = Field(min_length=1, max_length=2_000, description="x 的目标单位表达式")
+    y_to: str = Field(min_length=1, max_length=2_000, description="y 的目标单位表达式")
+    points: list[CalibrationPointModel] = Field(min_length=3, max_length=16)
+
+
+class FitCalibrationResponse(BaseModel):
+    slope: str
+    intercept: str
+    chi_square: str
+
+
 def _unprocessable(error: str, message: str, **extra) -> HTTPException:
     return HTTPException(
         status_code=422,
@@ -375,6 +412,25 @@ def solve_quantities_endpoint(
 
     return SolveQuantitiesResponse(values={
         name: format_result(values[name]) for name in sorted(values)})
+
+
+@app.post("/fit-calibration", response_model=FitCalibrationResponse)
+def fit_calibration_endpoint(
+        req: FitCalibrationRequest) -> FitCalibrationResponse:
+    points = [
+        CalibrationPoint(x=p.x, x_unit=p.x_unit, y=p.y,
+                         y_unit=p.y_unit, y_uncertainty=p.y_uncertainty)
+        for p in req.points
+    ]
+    try:
+        result = fit_calibration(req.x_to, req.y_to, points)
+    except CalibrationError as exc:
+        raise _unprocessable(exc.error, exc.message, **exc.extra)
+
+    return FitCalibrationResponse(
+        slope=format_result(result.slope),
+        intercept=format_result(result.intercept),
+        chi_square=format_result(result.chi_square))
 
 
 @app.get("/health")

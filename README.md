@@ -3,7 +3,8 @@
 基于 **Python + FastAPI + Decimal/Fraction** 的工程单位换算服务。
 支持长度、质量、时间、温度四维量纲核对，复合单位表达式，°C / °F 偏移温标换算，
 由多条乘积等式推断未知变量的四维量纲，从具名量中搜索最简无量纲乘积，
-独立测量值乘积的一阶合成标准不确定度传播，以及带单位线性方程组的精确求解。
+独立测量值乘积的一阶合成标准不确定度传播，带单位线性方程组的精确求解，
+以及按不确定度加权的线性标定拟合。
 
 ## 启动（单条命令）
 
@@ -213,6 +214,50 @@ curl -X POST http://localhost:8000/solve-quantities \
 `free_variables`）均返回 422；`°C` / `°F` 没有唯一的乘性比例，
 变量、项与右侧的单位一律拒绝（`offset_temperature_not_allowed`）。
 
+### POST /fit-calibration
+
+拟合线性标定式 **`y = a·x + b`**（slope=`a`，intercept=`b`）。请求体含
+目标单位 `x_to`、`y_to` 与 **3～16 个**标定点 `points`；每点给出
+`x`、`x_unit`、`y`、`y_unit`、`y_uncertainty`，其中数值均为有限十进制
+字符串，`y_uncertainty` **恒正**且与 `y` 同单位，`x` 视为精确量。
+各点可以使用不同单位，观测值与不确定度会先换到目标单位，
+`unit="1"` 表示无量纲：
+
+```json
+{
+  "x_to": "m",
+  "y_to": "kg",
+  "points": [
+    {"x": "0",    "x_unit": "m", "y": "1", "y_unit": "kg", "y_uncertainty": "0.1"},
+    {"x": "3000", "x_unit": "cm", "y": "2000", "y_unit": "g", "y_uncertainty": "100"},
+    {"x": "0.06", "x_unit": "km", "y": "3", "y_unit": "kg", "y_uncertainty": "0.1"}
+  ]
+}
+```
+
+按 **`w = 1/y_uncertainty²` 加权**，用正规方程与有理数精确求最小二乘解；
+换算后 `x` 不全相同是拟合的前提（全同返回 422 `constant_x_values`）。
+响应三个字段均为字符串，`slope` 单位为 `y_to/x_to`、`intercept` 单位为
+`y_to`，`chi_square = Σ[((y − a·x − b)/u)²]` 无量纲，统一按
+**ROUND_HALF_EVEN** 保留最多 **12 位小数**：
+
+```json
+{"slope": "0.033333333333", "intercept": "1", "chi_square": "0"}
+```
+
+```bash
+curl -X POST http://localhost:8000/fit-calibration \
+  -H 'Content-Type: application/json' \
+  -d '{"x_to":"m","y_to":"kg","points":[{"x":"0","x_unit":"m","y":"1","y_unit":"kg","y_uncertainty":"0.1"},{"x":"30","x_unit":"m","y":"2","y_unit":"kg","y_uncertainty":"0.1"},{"x":"60","x_unit":"m","y":"3","y_unit":"kg","y_uncertainty":"0.1"}]}'
+# {"slope":"0.033333333333","intercept":"1","chi_square":"0"}
+```
+
+点单位与目标单位量纲不符返回 `dimension_mismatch`（含 `point` 与
+`field`）；数值非法返回 `invalid_value`，`y_uncertainty` 非法或不严格为正
+返回 `invalid_uncertainty`；单位语法错误带 `position`，使用 `°C` /
+`°F` 返回 `offset_temperature_not_allowed`；`points` 数量不在 3～16 等
+请求体问题由 FastAPI 校验返回 422。
+
 ## 单位与表达式语法
 
 - 支持单位：`m`、`km`、`cm`、`mm`（长度）；`kg`、`g`（质量）；`s`、`min`、`h`（时间）；`K`、`°C`、`°F`（温度）。
@@ -253,6 +298,8 @@ curl -X POST http://localhost:8000/solve-quantities \
 | `zero_negative_power` | `/propagate-product` 的零值因子取了负幂，含 `factor` |
 | `unknown_variable` | `/solve-quantities` 的项引用了未声明的变量名，含 `equation` 与 `term` |
 | `no_solution` | `/solve-quantities` 的方程组矛盾，无解 |
+| `constant_x_values` | `/fit-calibration` 换算后所有 `x` 完全相同，斜率无法唯一确定 |
+| `invalid_uncertainty` | `/propagate-product` 因子的 `uncertainty` 不是有限十进制字符串或为负（含 `factor`），或 `/fit-calibration` 的 `y_uncertainty` 非法、不严格为正（含 `point`、`field`） |
 
 `/infer-dimensions` 的单位因子语法错误同样返回 `syntax_error`，并带
 `equation`（等式下标）、`side`（`left`/`right`）、`factor`（因子下标）
@@ -276,6 +323,13 @@ curl -X POST http://localhost:8000/solve-quantities \
 带相同坐标；`variables` 数量不在 1～8、`equations` 数量不在 1～16、
 `name` 空白或重复、`terms` 为空等请求体问题由 FastAPI 校验返回 422。
 
+`/fit-calibration` 的目标单位错误坐标为 `field: "x_to"` / `"y_to"`；
+各点单位错误坐标为 `point`（点下标）+ `field`（`x_unit` / `y_unit`）与
+0 起始的 `position`；`invalid_value`（`field` 为 `x` / `y`）、
+`invalid_uncertainty`、`dimension_mismatch` 同样带 `point`、`field`；
+`points` 数量不在 3～16、缺字段、未知字段等请求体问题由 FastAPI 校验
+返回 422。
+
 请求体缺字段、类型错误等由 FastAPI 校验，同样返回 422。
 
 ## 本地开发（不用 Docker）
@@ -295,7 +349,8 @@ app/
   dimensionless.py  # 最简无量纲乘积搜索（中途相遇枚举 ±6 整数指数）
   propagation.py    # 独立测量值乘积的一阶合成标准不确定度传播
   solver.py         # 带单位线性方程组的有理数精确求解（Gauss-Jordan 消元）
-  main.py           # FastAPI 应用（POST /convert、/infer-dimensions、/dimensionless-group、/propagate-product、/solve-quantities、GET /health）
+  calibration.py    # y = a·x + b 的 1/u² 加权最小二乘拟合（有理数正规方程）与残差卡方
+  main.py           # FastAPI 应用（POST /convert、/infer-dimensions、/dimensionless-group、/propagate-product、/solve-quantities、/fit-calibration、GET /health）
 tests/              # pytest 测试（核心逻辑 + HTTP API）
 Dockerfile
 docker-compose.yml
