@@ -3,7 +3,8 @@
 基于 **Python + FastAPI + Decimal/Fraction** 的工程单位换算服务。
 支持长度、质量、时间、温度四维量纲核对，复合单位表达式，°C / °F 偏移温标换算，
 由多条乘积等式推断未知变量的四维量纲，从具名量中搜索最简无量纲乘积，
-独立测量值乘积的一阶合成标准不确定度传播，以及带单位线性方程组的精确求解。
+独立测量值乘积的一阶合成标准不确定度传播，带单位线性方程组的精确求解，
+以及按 1/u² 加权的线性标定（y = a·x + b）最小二乘拟合。
 
 ## 启动（单条命令）
 
@@ -213,6 +214,57 @@ curl -X POST http://localhost:8000/solve-quantities \
 `free_variables`）均返回 422；`°C` / `°F` 没有唯一的乘性比例，
 变量、项与右侧的单位一律拒绝（`offset_temperature_not_allowed`）。
 
+### POST /fit-calibration
+
+按 **1/y_uncertainty² 加权**的最小二乘法拟合线性标定式 **y = a·x + b**。
+请求体含目标单位 `x_to`、`y_to` 与 **3～16 个**观测点 `points`；每点给出
+`x`、`x_unit`、`y`、`y_unit`、`y_uncertainty`——数值均为有限十进制字符串，
+`x` 视为精确值，`y_uncertainty` 必须 **> 0** 且与 `y` 同单位：
+
+```json
+{
+  "x_to": "m",
+  "y_to": "m",
+  "points": [
+    {"x": "1", "x_unit": "cm", "y": "10", "y_unit": "mm", "y_uncertainty": "10"},
+    {"x": "2", "x_unit": "cm", "y": "30", "y_unit": "mm", "y_uncertainty": "10"},
+    {"x": "3", "x_unit": "cm", "y": "50", "y_unit": "mm", "y_uncertainty": "10"}
+  ]
+}
+```
+
+复用单位表达式解析器，把各点的观测值与不确定度按乘性比例换算到
+`x_to` / `y_to` 并逐点核对量纲（`unit="1"` 表示无量纲）；`°C` / `°F`
+为偏移温标，目标单位与各点单位一律拒绝。随后用有理数精确求解加权正规方程，
+不存在浮点误差：
+
+```
+[ Σw    Σwx ] [b]   [ Σwy ]
+[ Σwx  Σwx² ] [a] = [ Σwxy]      （w = 1/y_uncertainty²）
+```
+
+响应的 `slope`、`intercept`、`chi_square` 均为字符串：斜率单位为
+**y_to/x_to**、截距单位为 **y_to**，
+`chi_square = Σ[((y − a·x − b)/y_uncertainty)²]`；三者按
+**ROUND_HALF_EVEN** 保留最多 **12 位小数**。上例换算后为
+x∈{0.01, 0.02, 0.03} m、y∈{0.01, 0.03, 0.05} m，故 y = 2·x − 0.01：
+
+```json
+{"slope": "2", "intercept": "-0.01", "chi_square": "0"}
+```
+
+```bash
+curl -X POST http://localhost:8000/fit-calibration \
+  -H 'Content-Type: application/json' \
+  -d '{"x_to":"m","y_to":"m","points":[{"x":"1","x_unit":"cm","y":"10","y_unit":"mm","y_uncertainty":"10"},{"x":"2","x_unit":"cm","y":"30","y_unit":"mm","y_uncertainty":"10"},{"x":"3","x_unit":"cm","y":"50","y_unit":"mm","y_uncertainty":"10"}]}'
+# {"slope":"2","intercept":"-0.01","chi_square":"0"}
+```
+
+换算到目标单位后所有 x **全相同**（无法确定斜率）返回 422
+（`all_x_equal`）；数值非法、`y_uncertainty ≤ 0`、量纲不符或使用
+`°C` / `°F` 同样返回 422，点级错误带 `point`（点下标），目标单位错误带
+`field`（`x_to` / `y_to`）。
+
 ## 单位与表达式语法
 
 - 支持单位：`m`、`km`、`cm`、`mm`（长度）；`kg`、`g`（质量）；`s`、`min`、`h`（时间）；`K`、`°C`、`°F`（温度）。
@@ -247,12 +299,13 @@ curl -X POST http://localhost:8000/solve-quantities \
 | `inconsistent_constraints` | 约束互相矛盾（如同一变量同时被约束为 `m` 与 `s`），含首个矛盾维度 `dimension` |
 | `underdetermined` | 约束/方程不足，存在无法唯一确定的变量，含 `free_variables` 列表 |
 | `fractional_dimensions` | 解唯一但含分数指数（如 `x^2 = m`），含相关 `variables` 列表 |
-| `offset_temperature_not_allowed` | `/infer-dimensions` 的单位因子、`/propagate-product` 或 `/solve-quantities` 的单位使用了 °C / °F；含坐标（及单位表达式内 `position`） |
+| `offset_temperature_not_allowed` | `/infer-dimensions` 的单位因子、`/propagate-product`、`/solve-quantities` 或 `/fit-calibration` 的单位使用了 °C / °F；含坐标（及单位表达式内 `position`） |
 | `no_dimensionless_group` | `/dimensionless-group` 在 -6～6 指数范围内不存在非平凡无量纲组合 |
-| `invalid_uncertainty` | `/propagate-product` 因子的 `uncertainty` 不是有限十进制字符串或为负，含 `factor` |
+| `invalid_uncertainty` | `/propagate-product` 因子的 `uncertainty`（含 `factor`）或 `/fit-calibration` 点的 `y_uncertainty`（含 `point`）不是有限十进制字符串、为负或不大于 0 |
 | `zero_negative_power` | `/propagate-product` 的零值因子取了负幂，含 `factor` |
 | `unknown_variable` | `/solve-quantities` 的项引用了未声明的变量名，含 `equation` 与 `term` |
 | `no_solution` | `/solve-quantities` 的方程组矛盾，无解 |
+| `all_x_equal` | `/fit-calibration` 换算到目标单位后的 x 全相同，斜率无法确定 |
 
 `/infer-dimensions` 的单位因子语法错误同样返回 `syntax_error`，并带
 `equation`（等式下标）、`side`（`left`/`right`）、`factor`（因子下标）
@@ -276,6 +329,12 @@ curl -X POST http://localhost:8000/solve-quantities \
 带相同坐标；`variables` 数量不在 1～8、`equations` 数量不在 1～16、
 `name` 空白或重复、`terms` 为空等请求体问题由 FastAPI 校验返回 422。
 
+`/fit-calibration` 的单位错误同样返回 `syntax_error` /
+`offset_temperature_not_allowed`，坐标字段为 `point`（点下标）或
+`field`（`x_to` / `y_to`）与 0 起始的 `position`；`invalid_value` /
+`invalid_uncertainty` / `dimension_mismatch` 带 `point`；`points` 数量
+不在 3～16、点缺字段或含多余字段等请求体问题由 FastAPI 校验返回 422。
+
 请求体缺字段、类型错误等由 FastAPI 校验，同样返回 422。
 
 ## 本地开发（不用 Docker）
@@ -295,7 +354,8 @@ app/
   dimensionless.py  # 最简无量纲乘积搜索（中途相遇枚举 ±6 整数指数）
   propagation.py    # 独立测量值乘积的一阶合成标准不确定度传播
   solver.py         # 带单位线性方程组的有理数精确求解（Gauss-Jordan 消元）
-  main.py           # FastAPI 应用（POST /convert、/infer-dimensions、/dimensionless-group、/propagate-product、/solve-quantities、GET /health）
+  calibration.py    # 线性标定 y=a·x+b 的 1/u² 加权最小二乘（有理数精确正规方程）
+  main.py           # FastAPI 应用（POST /convert、/infer-dimensions、/dimensionless-group、/propagate-product、/solve-quantities、/fit-calibration、GET /health）
 tests/              # pytest 测试（核心逻辑 + HTTP API）
 Dockerfile
 docker-compose.yml
